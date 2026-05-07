@@ -34,7 +34,7 @@ iMessage → Linq API → /webhook (FastAPI)
 
 - **LangGraph** orchestrates the agent workflow with per-phone-number persistent state
 - **SQLite** stores conversation memory across sessions
-- **Claude Sonnet 4** powers all agents
+- **Claude** powers all agents
 - Local workspace in `projects/` (git repos are auto-initialized)
 - GitHub integration for cloning repos and opening PRs
 
