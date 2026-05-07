@@ -20,9 +20,8 @@ def execute_tool(name: str, inputs: dict, local_path: str, github_token: str) ->
         case "push_and_open_pr":
             return push_and_open_pr(
                 local_path=local_path,
-                repo=inputs.get("repo", ""),
                 github_token=github_token,
-                **{k: v for k, v in inputs.items() if k != "repo"},
+                **inputs,
             )
         case _:
             return f"Unknown tool: {name}"

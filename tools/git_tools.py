@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import httpx
 from dotenv import load_dotenv
@@ -12,9 +13,39 @@ def _github_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
 
 
+def _git_with_auth(token: str, args: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """Run git with an in-memory Authorization header — token never written to disk."""
+    extraheader = f"http.https://github.com/.extraheader=Authorization: Bearer {token}"
+    return subprocess.run(
+        ["git", "-c", extraheader, *args],
+        capture_output=True,
+        text=True,
+        **kwargs,
+    )
+
+
+def _origin_repo(local_path: str) -> str | None:
+    """Parse owner/name from origin remote URL."""
+    result = subprocess.run(
+        ["git", "remote", "get-url", "origin"],
+        cwd=local_path,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    url = result.stdout.strip()
+    # Match https://github.com/owner/name(.git)? or git@github.com:owner/name(.git)?
+    m = re.search(r"github\.com[:/]([^/]+)/([^/.]+?)(?:\.git)?/?$", url)
+    if not m:
+        return None
+    return f"{m.group(1)}/{m.group(2)}"
+
+
 def clone_repo(repo: str, github_token: str) -> tuple[str, str]:
     """
     Clone a GitHub repo into projects/.
+    Token is passed via -c extraheader so it never lands in .git/config.
     Returns (local_path, error_message).
     """
     os.makedirs("projects", exist_ok=True)
@@ -24,13 +55,11 @@ def clone_repo(repo: str, github_token: str) -> tuple[str, str]:
     if os.path.exists(local_path):
         return local_path, ""
 
-    # Embed token in URL so private repos work
-    clone_url = f"https://{github_token}@github.com/{repo}.git"
+    clone_url = f"https://github.com/{repo}.git"
 
-    result = subprocess.run(
-        ["git", "clone", clone_url, local_path],
-        capture_output=True,
-        text=True,
+    result = _git_with_auth(
+        github_token,
+        ["clone", clone_url, local_path],
         timeout=120,
     )
 
@@ -42,26 +71,26 @@ def clone_repo(repo: str, github_token: str) -> tuple[str, str]:
 
 def push_and_open_pr(
     local_path: str,
-    repo: str,
     branch: str,
     title: str,
     body: str,
     github_token: str,
     base: str = "main",
+    repo: str | None = None,
 ) -> str:
-    """Push current branch and open a PR."""
+    """Push current branch and open a PR. Repo inferred from origin if not provided."""
+    repo = repo or _origin_repo(local_path)
+    if not repo:
+        return "Push failed: could not determine repo from origin remote"
 
-    # Push the branch
-    result = subprocess.run(
-        ["git", "push", "-u", "origin", branch],
+    push = _git_with_auth(
+        github_token,
+        ["push", "-u", "origin", branch],
         cwd=local_path,
-        capture_output=True,
-        text=True,
     )
-    if result.returncode != 0:
-        return f"Push failed: {result.stderr}"
+    if push.returncode != 0:
+        return f"Push failed: {push.stderr}"
 
-    # Open the PR via GitHub API
     response = httpx.post(
         f"{GITHUB_BASE}/repos/{repo}/pulls",
         headers=_github_headers(github_token),
@@ -71,8 +100,7 @@ def push_and_open_pr(
     if response.status_code != 201:
         return f"PR creation failed: {response.text}"
 
-    pr = response.json()
-    return pr["html_url"]
+    return response.json()["html_url"]
 
 
 GIT_TOOL_DEFINITIONS = [
@@ -95,7 +123,11 @@ GIT_TOOL_DEFINITIONS = [
     },
     {
         "name": "push_and_open_pr",
-        "description": "Push the current branch and open a pull request. Call this when work is complete.",
+        "description": (
+            "Push the current branch and open a pull request. "
+            "Repo is auto-detected from the local origin remote. "
+            "Call this when work is complete."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {

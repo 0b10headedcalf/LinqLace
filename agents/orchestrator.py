@@ -4,14 +4,16 @@ import asyncio
 import subprocess
 from anthropic import Anthropic
 from langgraph.graph import StateGraph, END
-from langgraph.constants import Send
+from langgraph.types import Send
 from state import AgentState
 from memory import checkpointer
 from agents import run_coder, run_tester
 
 client = Anthropic()
 
-WORKSPACE = os.path.abspath(os.getenv("WORKSPACE", "projects"))
+
+def _workspace() -> str:
+    return os.path.abspath(os.getenv("WORKSPACE", "projects"))
 
 SYSTEM_PROMPT = """You are an orchestrator for a team of specialist software engineering agents.
 You receive requests from a developer via iMessage and coordinate your team to fulfill them.
@@ -22,6 +24,8 @@ Your team:
 
 You MUST always call the create_plan tool. Never respond with plain text or code.
 Delegate all actual work to your team — do not write code or run commands yourself.
+
+Each task has a unique id (e.g. "t1", "t2"). Use these ids in depends_on to express ordering.
 
 For project_dir: infer a short slug from the request (e.g. "spotify-vote", "todo-app"). Only set needs_clarification=true if the request is so vague you genuinely cannot proceed at all."""
 
@@ -58,14 +62,22 @@ PLAN_TOOL = {
                 "items": {
                     "type": "object",
                     "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Unique task id e.g. 't1'",
+                        },
                         "agent": {
                             "type": "string",
                             "enum": ["coder", "tester"],
                         },
                         "task": {"type": "string"},
-                        "depends_on": {"type": "array", "items": {"type": "string"}},
+                        "depends_on": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Task ids this depends on",
+                        },
                     },
-                    "required": ["agent", "task", "depends_on"],
+                    "required": ["id", "agent", "task", "depends_on"],
                 },
             },
         },
@@ -79,7 +91,6 @@ PLAN_TOOL = {
 def plan(state: AgentState) -> dict:
     messages = state["messages"]
 
-    # Append current project to the last user message so Claude has context
     if state.get("local_path"):
         last = messages[-1]
         messages = messages[:-1] + [
@@ -112,7 +123,6 @@ def plan(state: AgentState) -> dict:
     plan_data = tool_block.input
     print(f"[plan] {plan_data}")
 
-    # Return the clarification question as the message so it's ready to send
     if plan_data.get("needs_clarification"):
         question = plan_data.get("clarification", "Which project should I work on?")
         return {
@@ -127,20 +137,18 @@ def plan(state: AgentState) -> dict:
 
 
 # ── Step 2: setup ──────────────────────────────────────────────────────────
-# Ensure local_path exists on disk before agents run.
 
 
 def setup(state: AgentState) -> dict:
-    plan_data = state.get("_plan", {})
+    plan_data = state.get("_plan") or {}
     project_dir = plan_data.get("project_dir", "")
 
-    if not project_dir:
+    if not project_dir or plan_data.get("needs_clarification"):
         return {}
 
-    local_path = os.path.join(WORKSPACE, project_dir)
+    local_path = os.path.join(_workspace(), project_dir)
     os.makedirs(local_path, exist_ok=True)
 
-    # Init git repo if not already one
     if not os.path.exists(os.path.join(local_path, ".git")):
         subprocess.run(["git", "init"], cwd=local_path, capture_output=True)
         subprocess.run(
@@ -165,12 +173,18 @@ def setup(state: AgentState) -> dict:
 
 def coder_node(state: AgentState) -> dict:
     result = run_coder(state, state.get("_current_task", ""))
-    return {"task_results": [result]}
+    return {
+        "task_results": [result],
+        "_completed_tasks": [state.get("_current_task_id", "")],
+    }
 
 
 def tester_node(state: AgentState) -> dict:
     result = run_tester(state, state.get("_current_task", ""))
-    return {"task_results": [result]}
+    return {
+        "task_results": [result],
+        "_completed_tasks": [state.get("_current_task_id", "")],
+    }
 
 
 # ── Step 3: synthesize ─────────────────────────────────────────────────────
@@ -212,22 +226,46 @@ def synthesize(state: AgentState) -> dict:
 # ── Routing ────────────────────────────────────────────────────────────────
 
 
-def after_plan(state: AgentState):
-    plan_data = state.get("_plan") or {}
-    print(f"[after_plan] {plan_data}")
+def runnable_tasks(plan_data: dict, completed: set[str]) -> list[dict]:
+    """Tasks whose deps are all satisfied and not yet completed."""
+    out = []
+    for t in plan_data.get("tasks", []):
+        if t.get("id") in completed:
+            continue
+        deps = t.get("depends_on") or []
+        if all(d in completed for d in deps):
+            out.append(t)
+    return out
 
-    if plan_data.get("needs_clarification") and not state.get("local_path"):
+
+def dispatch(state: AgentState):
+    """Conditional router. Returns Send list to fan out next wave, or 'synthesize' / END."""
+    plan_data = state.get("_plan") or {}
+
+    if plan_data.get("needs_clarification"):
         return END
 
     tasks = plan_data.get("tasks", [])
-    first_wave = [t for t in tasks if not t.get("depends_on")]
-    if not first_wave:
+    if not tasks:
         return END
 
-    print(f"[after_plan] dispatching {[t['agent'] for t in first_wave]}")
+    completed = set(state.get("_completed_tasks") or [])
+    if len(completed) >= len(tasks):
+        return "synthesize"
+
+    wave = runnable_tasks(plan_data, completed)
+    if not wave:
+        # deadlock: tasks remain but none runnable (cyclic / bad deps).
+        print(f"[dispatch] deadlock, completed={completed}, tasks={[t.get('id') for t in tasks]}")
+        return "synthesize"
+
+    print(f"[dispatch] wave: {[(t['id'], t['agent']) for t in wave]}")
     return [
-        Send(f"{task['agent']}_node", {**state, "_current_task": task["task"]})
-        for task in first_wave
+        Send(
+            f"{t['agent']}_node",
+            {**state, "_current_task": t["task"], "_current_task_id": t["id"]},
+        )
+        for t in wave
     ]
 
 
@@ -245,10 +283,15 @@ def build_graph():
 
     graph.set_entry_point("plan")
     graph.add_edge("plan", "setup")
-    graph.add_conditional_edges("setup", after_plan)
-
-    for node in ["coder_node", "tester_node"]:
-        graph.add_edge(node, "synthesize")
+    graph.add_conditional_edges(
+        "setup", dispatch, ["coder_node", "tester_node", "synthesize", END]
+    )
+    graph.add_conditional_edges(
+        "coder_node", dispatch, ["coder_node", "tester_node", "synthesize", END]
+    )
+    graph.add_conditional_edges(
+        "tester_node", dispatch, ["coder_node", "tester_node", "synthesize", END]
+    )
 
     graph.add_edge("synthesize", END)
 
@@ -263,8 +306,6 @@ agent = build_graph()
 async def run_orchestrator(phone_number: str, user_message: str) -> str:
     config = {"configurable": {"thread_id": phone_number}}
 
-    # operator.add reducer means we only pass the *new* user message;
-    # the checkpointer-restored history is appended to automatically.
     initial_state = {
         "messages": [{"role": "user", "content": user_message}],
         "phone_number": phone_number,
@@ -272,9 +313,9 @@ async def run_orchestrator(phone_number: str, user_message: str) -> str:
         "github_token": os.getenv("GITHUB_TOKEN"),
         "current_task": user_message,
         "_plan": None,
+        "_completed_tasks": [],
     }
 
-    # Run sync invoke in a thread so we don't block the event loop
     final_state = await asyncio.to_thread(agent.invoke, initial_state, config)
 
     for msg in reversed(final_state["messages"]):
