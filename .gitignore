@@ -11,3 +11,7 @@ wheels/
 
 # Secrets
 .env
+agent_memory.db*
+
+# Projects
+projects/*

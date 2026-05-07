@@ -1,10 +1,14 @@
 [project]
 name = "linqlace"
-version = "0.1.0"
-description = "Add your description here"
+version = "1.0.0"
+description = "Agentic framework"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "aiosqlite>=0.22.1",
+    "anthropic>=0.100.0",
+    "dotenv>=0.9.9",
+    "fastapi[standard]>=0.136.1",
     "httpx>=0.28.1",
     "langgraph>=1.1.10",
     "langgraph-checkpoint-sqlite>=3.0.3",
